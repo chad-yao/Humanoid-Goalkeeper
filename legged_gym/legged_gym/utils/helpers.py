@@ -36,7 +36,6 @@ import random
 from isaacgym import gymapi
 from isaacgym import gymutil
 import torch
-import torch.nn.functional as F
 import onnxruntime as ort
 
 
@@ -277,21 +276,54 @@ class PolicyOnnx(torch.nn.Module):
         self.history_length = actor_critic.actor_history_length
         self.num_one_step_obs = actor_critic.num_one_step_obs
         self.num_proprioceptive_obs = self.history_length * self.num_one_step_obs
+        self.num_actor_obs = actor_critic.num_actor_obs
+        self.num_regions = actor_critic.num_regions
         self.new_obs_start = self.num_one_step_obs * (self.history_length - 1)
 
     def forward(self, x):
+        history = x[:, :self.num_proprioceptive_obs]
+        cue = x[:, self.num_proprioceptive_obs:]
+        prior_target = cue[:, :3]
+        prior_region = cue[:, 3:4]
+        launch_flag = torch.clamp(cue[:, -2:-1], 0.0, 1.0)
+        estimator_ready = torch.clamp(cue[:, -1:], 0.0, 1.0)
 
-        history_latent = self.history_encoder(x)
-        estimate_ball = self.ball_estimator(x)
-        estimate_region = self.region_estimator(x)
-        estimate_region = torch.argmax(estimate_region, dim=-1, keepdim=True)
-        actor_input = torch.cat((x[:,-self.num_one_step_obs:], history_latent, estimate_ball, estimate_region), dim=-1)
+        history_latent = self.history_encoder(history)
+        estimate_ball = self.ball_estimator(history)
+        estimate_region_logits = self.region_estimator(history)
+        estimate_region = torch.argmax(
+            estimate_region_logits, dim=-1, keepdim=True
+        ).to(dtype=estimate_ball.dtype)
+        prior_region = prior_region.to(dtype=estimate_ball.dtype)
+
+        prior_ball = torch.cat(
+            (prior_target, torch.zeros_like(estimate_ball[:, 3:])), dim=-1
+        )
+        ball_used = (
+            (1.0 - estimator_ready) * prior_ball
+            + estimator_ready * estimate_ball
+        )
+        region_used = (
+            (1.0 - estimator_ready) * prior_region
+            + estimator_ready * estimate_region
+        )
+        actor_input = torch.cat(
+            (
+                history[:, -self.num_one_step_obs:],
+                history_latent,
+                ball_used,
+                region_used,
+                launch_flag,
+                estimator_ready,
+            ),
+            dim=-1,
+        )
 
         return self.actor(actor_input)
 
     def export(self, path, filename):
         self.to("cpu")
-        obs = torch.zeros(1, self.num_proprioceptive_obs)
+        obs = torch.zeros(1, self.num_actor_obs)
         torch.onnx.export(
             self,
             obs,
@@ -302,7 +334,4 @@ class PolicyOnnx(torch.nn.Module):
             input_names=["obs"],
             output_names=["actions"],
             dynamic_axes={},
-        )    
-
-
-    
+        )

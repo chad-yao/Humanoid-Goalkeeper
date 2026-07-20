@@ -121,13 +121,29 @@ class ActorCritic(nn.Module):
 
         self.num_regions = 6
 
-        mlp_input_dim_a = num_one_step_obs + self.history_latent_dim + self.estimate_ball_dim + 1
+        self.history_obs_dim = num_one_step_obs * actor_history_length
+        self.task_cue_dim = num_actor_obs - self.history_obs_dim
+        self.expected_task_cue_dim = 3 + 1 + 1 + 1
+        if self.task_cue_dim != self.expected_task_cue_dim:
+            raise ValueError(
+                f"ActorCritic expects {self.expected_task_cue_dim} task cue values "
+                f"after the {self.history_obs_dim}-value history, got {self.task_cue_dim}"
+            )
+
+        mlp_input_dim_a = (
+            num_one_step_obs
+            + self.history_latent_dim
+            + self.estimate_ball_dim
+            + 1  # region ID
+            + 1  # launch flag
+            + 1  # estimator-ready flag
+        )
         
         self.num_actor_input  = mlp_input_dim_a
 
         mlp_input_dim_c = num_critic_obs
 
-        mlp_input_dim_h = num_one_step_obs * actor_history_length
+        mlp_input_dim_h = self.history_obs_dim
 
         self.history_encoder = nn.Sequential(
             nn.Linear(mlp_input_dim_h, 128),
@@ -223,13 +239,7 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, obs_history):
-
-        history_latent = self.history_encoder(obs_history)
-        
-        self.estimate_ball = self.ball_estimator(obs_history)
-
-        self.estimate_region = self.region_estimator(obs_history)
-        actor_input = torch.cat((obs_history[:,-self.num_one_step_obs:], history_latent, self.estimate_ball, torch.argmax(self.estimate_region, dim=-1, keepdim=True)), dim=-1)
+        actor_input, self.estimate_ball, self.estimate_region = self._actor_input(obs_history)
         
         action_mean = self.actor(actor_input)
         
@@ -243,18 +253,53 @@ class ActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, obs_history, observations=None):
-
-        history_latent = self.history_encoder(obs_history)
-        
-        estimate_ball = self.ball_estimator(obs_history)
-        
-        estimate_region = self.region_estimator(obs_history)
-
-        actor_input = torch.cat((obs_history[:,-self.num_one_step_obs:], history_latent, estimate_ball, torch.argmax(estimate_region, dim=-1, keepdim=True)), dim=-1)
+        actor_input, _, _ = self._actor_input(obs_history)
 
         action_mean = self.actor(actor_input)
 
         return action_mean
+
+    def _actor_input(self, observations):
+        history = observations[:, :self.history_obs_dim]
+        cue = observations[:, self.history_obs_dim:]
+
+        prior_target = cue[:, :3]
+        prior_region_id = cue[:, 3:4]
+        launch_flag = cue[:, -2:-1].clamp(0.0, 1.0)
+        estimator_ready = cue[:, -1:].clamp(0.0, 1.0)
+
+        history_latent = self.history_encoder(history)
+        estimate_ball_raw = self.ball_estimator(history)
+        estimate_region_logits = self.region_estimator(history)
+        estimate_region_id = torch.argmax(
+            estimate_region_logits, dim=-1, keepdim=True
+        ).to(dtype=estimate_ball_raw.dtype)
+        prior_region_id = prior_region_id.to(dtype=estimate_ball_raw.dtype)
+
+        prior_ball = torch.cat(
+            (prior_target, torch.zeros_like(estimate_ball_raw[:, 3:])), dim=-1
+        )
+        ball_used = (
+            (1.0 - estimator_ready) * prior_ball
+            + estimator_ready * estimate_ball_raw
+        )
+        region_used = (
+            (1.0 - estimator_ready) * prior_region_id
+            + estimator_ready * estimate_region_id
+        )
+
+        actor_input = torch.cat(
+            (
+                history[:, -self.num_one_step_obs:],
+                history_latent,
+                ball_used,
+                region_used,
+                launch_flag,
+                estimator_ready,
+            ),
+            dim=-1,
+        )
+        return actor_input, estimate_ball_raw, estimate_region_logits
 
 
     def evaluate(self, critic_observations, **kwargs):

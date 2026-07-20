@@ -223,9 +223,20 @@ class HIMPPO:
                 else:
                     value_loss = (returns_batch - value_batch).pow(2).mean()
                 
-                # est ball loss
-                est_loss = (estball_batch - gtball_batch).pow(2).mean()
-                region_loss = nn.CrossEntropyLoss()(estregion_batch, gtregion_batch)
+                # The online estimators have no information about the hidden
+                # kick intent while the ball is held. Train their auxiliary
+                # objectives only after launch. The ball estimator can also
+                # receive PPO gradients through the actor; the scalar argmax
+                # region selection is trained only by cross-entropy here.
+                launched = obs_batch[:, -2] > 0.5
+                if launched.any():
+                    est_loss = (estball_batch[launched] - gtball_batch[launched]).pow(2).mean()
+                    region_loss = nn.functional.cross_entropy(
+                        estregion_batch[launched], gtregion_batch[launched]
+                    )
+                else:
+                    est_loss = estball_batch.sum() * 0.0
+                    region_loss = estregion_batch.sum() * 0.0
                 loss = surrogate_loss + est_loss + region_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
                 # Smooth loss

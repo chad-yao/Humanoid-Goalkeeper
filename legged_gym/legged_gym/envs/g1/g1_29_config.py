@@ -13,13 +13,31 @@ class G129Cfg(LeggedRobotCfg):
         num_one_step_observations = 6 + num_ballobs + num_dofs * 2 + num_actions
         num_privileged_obs = 6 + num_ballobs + num_dofs * 2 + num_actions  + 3 + 1 + 6 + 6 + 1
 
-        num_observations = num_actor_history * num_one_step_observations
+        # The cue is deliberately kept outside the temporal observation history:
+        # rough target xyz, scalar prior region ID, launch flag, and estimator-ready flag.
+        num_task_cue_obs = 6
+        num_observations = num_actor_history * num_one_step_observations + num_task_cue_obs
 
         env_spacing = 5.  # not used with heightfields/trimeshes 
         send_timeouts = True # send time out information to the algorithm
-        episode_length_s = 3 # episode length in seconds
+        episode_length_s = 3 # original-length no-PREPARE ablation
         ball_gravity = True
         play = False
+
+        # Phase timing configuration. launch_during_init=True keeps the
+        # original first-stage behavior where the ball moves during INIT.
+        # Phase durations are expressed directly in policy steps. One policy
+        # step is currently 0.02 s, so INIT [3, 10] matches the original code.
+        init_hold_step_range = [3, 10]
+        prepare_step_range = [0, 0]
+        launch_during_init = True
+        estimator_warmup_time = 0.0
+
+        # Uniform noise applied to the privileged pre-kick target cue in the
+        # goal/world y-z directions. Region corruption is configurable for a
+        # later robustness curriculum and is disabled by default.
+        prior_target_noise_yz = [0.05, 0.025]
+        prior_region_error_prob = 0.0
 
     class commands:
         
@@ -303,6 +321,7 @@ class G129Cfg(LeggedRobotCfg):
             # move rewards
             stayonline = -2.0
             noretreat = -2.0
+            prepareheading = 2.0
 
             # feet rewards
             successland = 4.0
