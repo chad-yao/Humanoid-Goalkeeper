@@ -159,7 +159,7 @@ class TaskRegistry():
             else:
                 resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
             print(f"Loading resume checkpoint selected by --checkpoint: {resume_path}")
-            runner.load(resume_path, allow_partial=args.allow_partial_resume)
+            runner.load(resume_path)
         return runner, train_cfg
 
 # make global task registry

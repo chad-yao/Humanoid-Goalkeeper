@@ -213,8 +213,6 @@ def get_args():
         {"name": "--run_name", "type": str,  "help": "Name of the run. Overrides config file if provided."},
         {"name": "--load_run", "type": str,  "help": "Name of the run to load when resume=True. If -1: will load the last run. Overrides config file if provided."},
         {"name": "--checkpoint", "type": int,  "help": "Saved model checkpoint number. If -1: will load the last checkpoint. Overrides config file if provided."},
-        {"name": "--allow_partial_resume", "action": "store_true", "default": False,
-         "help": "Allow actor-only warm start from a legacy checkpoint. This is not an exact resume."},
         {"name": "--exptid", "type": str, "help": "exptid"},
         {"name": "--resumeid", "type": str, "help": "exptid"},
         {"name": "--headless", "action": "store_true", "default": True, "help": "Force display off at all times"},

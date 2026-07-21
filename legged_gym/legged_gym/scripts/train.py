@@ -44,10 +44,7 @@ def train(args, headless=True):
     save_path = os.path.join(LEGGED_GYM_ROOT_DIR)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args,log_root = save_path)
 
-    ppo_runner.learn(
-        num_learning_iterations=train_cfg.runner.max_iterations,
-        init_at_random_ep_len=not args.resume,
-    )
+    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
 
 if __name__ == '__main__':
     args = get_args()
