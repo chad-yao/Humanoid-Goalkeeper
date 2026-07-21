@@ -30,8 +30,10 @@
 
 import time
 import os
+import random
 from collections import deque
 import statistics
+import numpy as np
 
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
@@ -49,6 +51,8 @@ from rsl_rl.modules import AMP
 from rsl_rl.utils.utils import Normalizer
 
 class HIMOnPolicyRunner:
+
+    CHECKPOINT_VERSION = 3
 
     def __init__(self,
                  env: VecEnv,
@@ -217,8 +221,15 @@ class HIMOnPolicyRunner:
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            # `it` has just finished.  Advance the runner state before saving so
+            # a resumed run starts at the next iteration and never immediately
+            # overwrites the checkpoint it was loaded from.
+            self.current_learning_iteration = it + 1
+            if self.current_learning_iteration % self.save_interval == 0:
+                self.save(os.path.join(
+                    self.log_dir,
+                    'model_{}.pt'.format(self.current_learning_iteration),
+                ))
             ep_infos.clear()
             if it == start_iter:
                 # obtain all the diff files
@@ -227,7 +238,6 @@ class HIMOnPolicyRunner:
                 if self.logger_type == "wandb" and git_file_paths:
                     for path in git_file_paths:
                         self.writer.save_file(path)
-            self.current_learning_iteration = it
         
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
 
@@ -380,23 +390,140 @@ class HIMOnPolicyRunner:
 
         
     def save(self, path, infos=None):
+        amp_normalizer = self.alg.amp_normalizer
         state_dict = {
+            'checkpoint_version': self.CHECKPOINT_VERSION,
             'model_state_dict': self.alg.actor_critic.state_dict(),
+            'amp_state_dicts': {
+                name: model.state_dict() for name, model in self.alg.amp.items()
+            },
+            'amp_normalizer_state': {
+                'mean': amp_normalizer.mean,
+                'var': amp_normalizer.var,
+                'count': amp_normalizer.count,
+            },
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
-            'iter': self.current_learning_iteration + 1,
+            'iter': self.current_learning_iteration,
+            'tot_timesteps': self.tot_timesteps,
+            'tot_time': self.tot_time,
+            'algorithm_state': {
+                'learning_rate': self.alg.learning_rate,
+            },
+            'env_training_state': self._get_env_training_state(),
+            'rng_state': {
+                'python': random.getstate(),
+                'numpy': np.random.get_state(),
+                'torch': torch.get_rng_state(),
+                'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
             'infos': infos,
             }
         torch.save(state_dict, path)
 
 
-    def load(self, path, load_optimizer=True):
+    def load(self, path, load_optimizer=True, allow_partial=False):
         loaded_dict = torch.load(path, map_location=self.device)
+        is_full_checkpoint = loaded_dict.get('checkpoint_version') == self.CHECKPOINT_VERSION
+        if not is_full_checkpoint and not allow_partial:
+            raise RuntimeError(
+                "Refusing partial resume from legacy checkpoint "
+                f"'{path}'. AMP, normalizer, curriculum, and RNG state were not "
+                "saved in the old format. Use a "
+                f"version-{self.CHECKPOINT_VERSION} checkpoint for exact resume, or pass "
+                "--allow_partial_resume for an explicit actor-only warm start."
+            )
+
+        if is_full_checkpoint and not load_optimizer:
+            raise ValueError(
+                "Strict resume requires load_optimizer=True. Loading model state "
+                "without optimizer state is a warm start, not an exact resume."
+            )
+
+        if is_full_checkpoint:
+            saved_amp_names = set(loaded_dict['amp_state_dicts'])
+            current_amp_names = set(self.alg.amp)
+            if saved_amp_names != current_amp_names:
+                raise RuntimeError(
+                    "AMP model set mismatch: "
+                    f"checkpoint={sorted(saved_amp_names)}, "
+                    f"current={sorted(current_amp_names)}"
+                )
+
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
 
-        if load_optimizer:
+        if is_full_checkpoint:
+            for name, state in loaded_dict['amp_state_dicts'].items():
+                self.alg.amp[name].load_state_dict(state)
+            normalizer_state = loaded_dict['amp_normalizer_state']
+            self.alg.amp_normalizer.mean = normalizer_state['mean']
+            self.alg.amp_normalizer.var = normalizer_state['var']
+            self.alg.amp_normalizer.count = normalizer_state['count']
+        else:
+            warnings.warn(
+                "Legacy checkpoint has no AMP discriminator/normalizer state. "
+                "Actor weights were restored, but this is not an exact training "
+                "resume. The optimizer is intentionally reinitialized because it "
+                "contains stale AMP moments.",
+                RuntimeWarning,
+            )
+
+        if load_optimizer and is_full_checkpoint:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
         self.current_learning_iteration = loaded_dict['iter']
-        return loaded_dict['infos']
+        if is_full_checkpoint:
+            self.tot_timesteps = loaded_dict['tot_timesteps']
+            self.tot_time = loaded_dict['tot_time']
+            self.alg.learning_rate = loaded_dict['algorithm_state']['learning_rate']
+            self._set_env_training_state(loaded_dict['env_training_state'])
+            self._set_rng_state(loaded_dict['rng_state'])
+        print(
+            f"Resumed from checkpoint: {path} "
+            f"(iteration={self.current_learning_iteration}, "
+            f"full_state={is_full_checkpoint}, "
+            f"version={loaded_dict.get('checkpoint_version', 'legacy')})"
+        )
+        return loaded_dict.get('infos')
+
+    def _get_env_training_state(self):
+        """Capture the environment state that changes the training distribution."""
+        state = {}
+        for name in (
+            'curriculumupdate', 'curriculumsigma', 'common_step_counter',
+            'last_step_counter', 'command_ranges', 'success_rate',
+            'reward_scales', 'task_scale',
+            'shared_init_hold_steps', 'shared_prepare_steps', 'startstep',
+            'init_hold_steps', 'launch_steps',
+        ):
+            if hasattr(self.env, name):
+                value = getattr(self.env, name)
+                if torch.is_tensor(value):
+                    value = value.detach().cpu().clone()
+                elif isinstance(value, dict):
+                    value = value.copy()
+                state[name] = value
+        return state
+
+    def _set_env_training_state(self, state):
+        if not state:
+            return
+        for name, value in state.items():
+            if not hasattr(self.env, name):
+                continue
+            current = getattr(self.env, name)
+            if torch.is_tensor(current):
+                current.copy_(value.to(device=current.device, dtype=current.dtype))
+            else:
+                setattr(self.env, name, value)
+
+    @staticmethod
+    def _set_rng_state(state):
+        if not state:
+            return
+        random.setstate(state['python'])
+        np.random.set_state(state['numpy'])
+        torch.set_rng_state(state['torch'].cpu())
+        if torch.cuda.is_available() and state.get('cuda') is not None:
+            torch.cuda.set_rng_state_all([rng.cpu() for rng in state['cuda']])
 
     def get_inference_policy(self, device=None):
         self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
